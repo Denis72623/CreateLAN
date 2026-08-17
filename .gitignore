@@ -1,0 +1,14 @@
+# Ignore build artifacts and binaries
+*.exe
+*.7z
+*.pdb
+*.user
+bin/
+obj/
+.vs/
+
+# Ignore Visual Studio workspace files
+*.sln.docstates
+
+# Ignore release assets
+releases/

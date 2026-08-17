@@ -1,7 +1,8 @@
-﻿#include "network.h"
+#include "network.h"
 #include <ws2tcpip.h>
 #include <objbase.h>
 #include <clocale>
+#include <string>
 
 HWND hIpInput, hPortInput, hBtnServer, hBtnClient, hBtnStop, hLogZone;
 
@@ -24,7 +25,7 @@ void StopNetwork() {
     for (SOCKET sock : g_ServerClients) { shutdown(sock, SD_BOTH); closesocket(sock); }
     g_ServerClients.clear();
 
-    if (g_WintunAdapter) { WintunCloseAdapter(g_WintunAdapter); g_WintunAdapter = nullptr; g_WintunSession = nullptr; }
+    if (g_WintunAdapter) { if (WintunCloseAdapter) WintunCloseAdapter(g_WintunAdapter); g_WintunAdapter = nullptr; g_WintunSession = nullptr; }
     WSACleanup();
 
     LogMessage(L"[STATUS] Туннель полностью отключен.");
@@ -32,24 +33,42 @@ void StopNetwork() {
     EnableWindow(hBtnClient, TRUE);
 }
 
+bool ExecuteNetshCommand(const std::wstring& cmd) {
+    // Build command line: netsh <cmd>
+    std::wstring full = L"netsh ";
+    full += cmd;
+    // CreateProcess requires writable buffer
+    std::vector<wchar_t> buf(full.begin(), full.end());
+    buf.push_back(0);
+
+    STARTUPINFOW si{}; PROCESS_INFORMATION pi{};
+    si.cb = sizeof(si);
+    BOOL ok = CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (!ok) return false;
+    // wait briefly
+    WaitForSingleObject(pi.hProcess, 5000);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    return true;
+}
+
 bool SetupVirtualAdapter(int mode) {
     GUID adapterGuid;
     CoCreateGuid(&adapterGuid);
     g_WintunAdapter = WintunCreateAdapter(L"P2P_Virtual_LAN", L"WintunTunnel", &adapterGuid);
-    if (!g_WintunAdapter) { LogMessage(L"[ERR] Требуются права Администратора!"); return false; }
+    if (!g_WintunAdapter) { LogMessage(L"[ERR] Требуются права Ад��инистратора!"); return false; }
     g_WintunSession = WintunStartSession(g_WintunAdapter, 0x400000);
-    if (!g_WintunSession) { WintunCloseAdapter(g_WintunAdapter); return false; }
+    if (!g_WintunSession) { if (WintunCloseAdapter) WintunCloseAdapter(g_WintunAdapter); return false; }
 
     LogMessage(L"[OK] Интерфейс Wintun запущен в ядре x64.");
-    WinExec("netsh interface set interface name=\"P2P_Virtual_LAN\" admin=enabled", SW_HIDE);
+    // Use CreateProcess instead of WinExec
+    ExecuteNetshCommand(L"interface set interface name=\"P2P_Virtual_LAN\" admin=enabled");
 
     // Автоматическое назначение IP: Серверу ставим .1, Клиенту ставим .2
-    std::string ipStr = (mode == 1) ? "10.8.0.1" : "10.8.0.2";
-    std::string ipCmd = "netsh interface ip set address name=\"P2P_Virtual_LAN\" static " + ipStr + " 255.255.255.0";
-    WinExec(ipCmd.c_str(), SW_HIDE);
+    std::wstring ipStr = (mode == 1) ? L"10.8.0.1" : L"10.8.0.2";
+    std::wstring ipCmd = L"interface ip set address name=\"P2P_Virtual_LAN\" static " + ipStr + L" 255.255.255.0";
+    ExecuteNetshCommand(ipCmd);
 
-    std::wstring wIpStr(ipStr.begin(), ipStr.end());
-    LogMessage(L"[NET] Системой автоматически выделен IP: " + wIpStr);
+    LogMessage(L"[NET] Системой автоматически выделен IP: " + ipStr);
     std::this_thread::sleep_for(std::chrono::seconds(2));
     return true;
 }
@@ -59,11 +78,12 @@ void AsyncServerThread(int port) {
     WSADATA wsaData; WSAStartup(MAKEWORD(2, 2), &wsaData);
 
     g_ListenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (g_ListenSocket == INVALID_SOCKET) { LogMessage(L"[ERR] Не удалось создать слушающий сокет."); StopNetwork(); return; }
     int nodelay = 1; setsockopt(g_ListenSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(int));
 
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_ANY); addr.sin_port = htons(static_cast<u_short>(port));
-    bind(g_ListenSocket, (SOCKADDR*)&addr, sizeof(addr));
-    listen(g_ListenSocket, SOMAXCONN);
+    if (bind(g_ListenSocket, (SOCKADDR*)&addr, sizeof(addr)) == SOCKET_ERROR) { LogMessage(L"[ERR] bind() failed."); StopNetwork(); return; }
+    if (listen(g_ListenSocket, SOMAXCONN) == SOCKET_ERROR) { LogMessage(L"[ERR] listen() failed."); StopNetwork(); return; }
 
     g_TunnelActive = true;
     std::thread(ServerOsToNetworkWorker).detach();
@@ -93,6 +113,7 @@ void AsyncClientThread(std::string ip, int port) {
     WSADATA wsaData; WSAStartup(MAKEWORD(2, 2), &wsaData);
 
     g_ClientActiveSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (g_ClientActiveSocket == INVALID_SOCKET) { LogMessage(L"[ERR] Не удалось создать клиентский сокет."); StopNetwork(); return; }
     int nodelay = 1; setsockopt(g_ClientActiveSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(int));
 
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(static_cast<u_short>(port));
@@ -108,9 +129,11 @@ void AsyncClientThread(std::string ip, int port) {
     std::thread(ClientOsToNetworkWorker).detach();
 
     while (g_TunnelActive) {
-        DWORD packetSize = 0;
-        int res = recv(g_ClientActiveSocket, reinterpret_cast<char*>(&packetSize), sizeof(packetSize), 0);
+        uint32_t packetSizeNet = 0;
+        int res = recv(g_ClientActiveSocket, reinterpret_cast<char*>(&packetSizeNet), sizeof(packetSizeNet), 0);
         if (res <= 0) break;
+        uint32_t packetSize = ntohl(packetSizeNet);
+        if (packetSize == 0 || packetSize > MAX_PACKET_SIZE) break;
 
         std::vector<char> recvBuffer(packetSize);
         int bytesRead = 0;
@@ -120,8 +143,10 @@ void AsyncClientThread(std::string ip, int port) {
         }
         for (DWORD i = 0; i < packetSize; ++i) recvBuffer[i] ^= ENCRYPTION_KEY;
 
-        BYTE* osPacket = WintunAllocateSendPacket(g_WintunSession, packetSize);
-        if (osPacket) { memcpy(osPacket, recvBuffer.data(), packetSize); WintunSendPacket(g_WintunSession, osPacket); }
+        if (g_WintunSession && WintunAllocateSendPacket && WintunSendPacket) {
+            BYTE* osPacket = WintunAllocateSendPacket(g_WintunSession, packetSize);
+            if (osPacket) { memcpy(osPacket, recvBuffer.data(), packetSize); WintunSendPacket(g_WintunSession, osPacket); }
+        }
     }
     StopNetwork();
 }
@@ -149,65 +174,5 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnStop = CreateWindowW(L"Button", L"[ ОТКЛЮЧИТСЯ ]", WS_VISIBLE | WS_CHILD, 510, 90, 150, 35, hwnd, (HMENU)IDC_BTN_STOP, NULL, NULL);
 
         HWND t4 = CreateWindowW(L"Static", L" ЖУРНАЛ:", WS_VISIBLE | WS_CHILD, 20, 140, 350, 20, hwnd, NULL, NULL, NULL);
-        hLogZone = CreateWindowW(L"Edit", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 20, 165, 640, 180, hwnd, (HMENU)IDC_LOG_ZONE, NULL, NULL);
+        hLogZone = CreateWindowW(L"Edit", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 20, 165, 640, 180, hwnd, (HMENU)IDC_LOG_ZONE, NULL, NU[...]
 
-        SendMessageW(hIpInput, WM_SETFONT, (WPARAM)hFont, TRUE); SendMessageW(hPortInput, WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hBtnServer, WM_SETFONT, (WPARAM)hFont, TRUE); SendMessageW(hBtnClient, WM_SETFONT, (WPARAM)hFont, TRUE); SendMessageW(hBtnStop, WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hLogZone, WM_SETFONT, (WPARAM)hFont, TRUE); SendMessageW(t1, WM_SETFONT, (WPARAM)hFont, TRUE); SendMessageW(t2, WM_SETFONT, (WPARAM)hFont, TRUE); SendMessageW(t4, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-        if (!InitializeWintunDLL()) { LogMessage(L"[ERR] Библиотека wintun.dll x64 не найдена!"); }
-        break;
-    }
-    case WM_COMMAND: {
-        int wmId = LOWORD(wp);
-        if (wmId == IDC_BTN_SERVER) {
-            wchar_t portBuf[32];
-            GetWindowTextW(hPortInput, portBuf, 32);
-            int port = _wtoi(portBuf);
-
-            EnableWindow(hBtnServer, FALSE); EnableWindow(hBtnClient, FALSE);
-            std::thread(AsyncServerThread, port).detach();
-        }
-        else if (wmId == IDC_BTN_CLIENT) {
-            wchar_t ipBuf[64], portBuf[32];
-            GetWindowTextW(hIpInput, ipBuf, 64);
-            GetWindowTextW(hPortInput, portBuf, 32);
-
-            int port = _wtoi(portBuf);
-            std::wstring ws(ipBuf);
-            std::string ipStr(ws.begin(), ws.end());
-
-            EnableWindow(hBtnServer, FALSE); EnableWindow(hBtnClient, FALSE);
-            std::thread(AsyncClientThread, ipStr, port).detach();
-        }
-        else if (wmId == IDC_BTN_STOP) {
-            StopNetwork();
-        }
-        break;
-    }
-    case WM_DESTROY:
-        StopNetwork();
-        DeleteObject(hBackBrush);
-        PostQuitMessage(0);
-        break;
-    default:
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    return 0;
-}
-
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
-    std::setlocale(LC_ALL, "Russian");
-    WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.lpszClassName = L"P2P_WINDOW";
-    wc.hbrBackground = hBackBrush; wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    RegisterClassW(&wc);
-
-    HWND hwnd = CreateWindowExW(0, L"P2P_WINDOW", L"Объеденение локальных сетей ",
-        WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 695, 420, NULL, NULL, hInst, NULL);
-    if (!hwnd) return 0;
-    ShowWindow(hwnd, nCmdShow); UpdateWindow(hwnd);
-
-    MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    return (int)msg.wParam;
-}

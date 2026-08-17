@@ -1,6 +1,9 @@
-﻿#include "network.h"
+#include "network.h"
 #include <ws2tcpip.h>
 #include <vector>
+#include <atomic>
+#include <winsock2.h>
+#include <stdint.h>
 
 WINTUN_CREATE_ADAPTER_FUNC WintunCreateAdapter = nullptr;
 WINTUN_START_SESSION_FUNC WintunStartSession = nullptr;
@@ -19,7 +22,7 @@ int g_ClientSlot = 2;
 
 HANDLE g_WintunAdapter = nullptr;
 HANDLE g_WintunSession = nullptr;
-const char ENCRYPTION_KEY = 'X';
+const unsigned char ENCRYPTION_KEY = 'X';
 
 std::thread g_Thread1;
 std::thread g_Thread2;
@@ -44,69 +47,126 @@ void LogMessage(const std::wstring& msg) {
     SendMessageW(hLogZone, EM_REPLACESEL, 0, (LPARAM)dynamicMsg.c_str());
 }
 
+// Helper: receive exactly len bytes or fail
+static bool SafeRecvFully(SOCKET sock, void* buf, int len) {
+    char* p = static_cast<char*>(buf);
+    int received = 0;
+    while (received < len) {
+        int r = recv(sock, p + received, len - received, 0);
+        if (r <= 0) return false;
+        received += r;
+    }
+    return true;
+}
+
+// Helper: send exactly len bytes or fail
+static bool SafeSendFully(SOCKET sock, const void* buf, int len) {
+    const char* p = static_cast<const char*>(buf);
+    int sent = 0;
+    while (sent < len) {
+        int s = send(sock, p + sent, len - sent, 0);
+        if (s == SOCKET_ERROR || s == 0) return false;
+        sent += s;
+    }
+    return true;
+}
+
 void EncryptAndSend(SOCKET sock, BYTE* data, DWORD size) {
+    if (sock == INVALID_SOCKET) return;
+    if (size == 0 || size > MAX_PACKET_SIZE) return; // validate size
+
     std::vector<char> sendBuffer(size);
     for (DWORD i = 0; i < size; ++i) {
         sendBuffer[i] = data[i] ^ ENCRYPTION_KEY;
     }
-    send(sock, reinterpret_cast<char*>(&size), sizeof(size), 0);
-    send(sock, sendBuffer.data(), static_cast<int>(size), 0);
+
+    uint32_t netSize = htonl(static_cast<uint32_t>(size));
+    if (!SafeSendFully(sock, &netSize, sizeof(netSize))) {
+        // send failed
+        return;
+    }
+    if (!SafeSendFully(sock, sendBuffer.data(), static_cast<int>(size))) {
+        return;
+    }
 }
 
 void ServerOsToNetworkWorker() {
     while (g_TunnelActive) {
+        if (!g_WintunSession || !WintunReceivePacket) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
         DWORD packetSize = 0;
         BYTE* packetData = WintunReceivePacket(g_WintunSession, &packetSize);
         if (packetData && packetSize > 0) {
+            if (packetSize > MAX_PACKET_SIZE) {
+                // skip unexpected large packet
+                WintunReleaseReceivePacket(g_WintunSession, packetData);
+                continue;
+            }
             std::lock_guard<std::mutex> lock(g_ClientsMutex);
             for (SOCKET sock : g_ServerClients) {
                 EncryptAndSend(sock, packetData, packetSize);
             }
             WintunReleaseReceivePacket(g_WintunSession, packetData);
         }
+        else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
 }
 
 void ClientOsToNetworkWorker() {
     while (g_TunnelActive) {
+        if (!g_WintunSession || !WintunReceivePacket) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
         DWORD packetSize = 0;
         BYTE* packetData = WintunReceivePacket(g_WintunSession, &packetSize);
         if (packetData && packetSize > 0) {
+            if (packetSize > MAX_PACKET_SIZE) {
+                WintunReleaseReceivePacket(g_WintunSession, packetData);
+                continue;
+            }
             EncryptAndSend(g_ClientActiveSocket, packetData, packetSize);
             WintunReleaseReceivePacket(g_WintunSession, packetData);
+        }
+        else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 }
 
 void ServerSingleClientWorker(SOCKET clientSock) {
     while (g_TunnelActive) {
-        DWORD packetSize = 0;
-        int res = recv(clientSock, reinterpret_cast<char*>(&packetSize), sizeof(packetSize), 0);
-        if (res <= 0) break;
+        uint32_t packetSizeNet = 0;
+        if (!SafeRecvFully(clientSock, &packetSizeNet, sizeof(packetSizeNet))) break;
+        uint32_t packetSize = ntohl(packetSizeNet);
+        if (packetSize == 0 || packetSize > MAX_PACKET_SIZE) break;
 
         std::vector<char> recvBuffer(packetSize);
-        int bytesRead = 0;
-        while (bytesRead < static_cast<int>(packetSize)) {
-            int currentRead = recv(clientSock, recvBuffer.data() + bytesRead, static_cast<int>(packetSize) - bytesRead, 0);
-            if (currentRead <= 0) break;
-            bytesRead += currentRead;
-        }
+        if (!SafeRecvFully(clientSock, recvBuffer.data(), static_cast<int>(packetSize))) break;
 
         for (DWORD i = 0; i < packetSize; ++i) { recvBuffer[i] ^= ENCRYPTION_KEY; }
 
-        BYTE* osPacket = WintunAllocateSendPacket(g_WintunSession, packetSize);
-        if (osPacket) {
-            memcpy(osPacket, recvBuffer.data(), packetSize);
-            WintunSendPacket(g_WintunSession, osPacket);
+        if (g_WintunSession && WintunAllocateSendPacket && WintunSendPacket) {
+            BYTE* osPacket = WintunAllocateSendPacket(g_WintunSession, packetSize);
+            if (osPacket) {
+                memcpy(osPacket, recvBuffer.data(), packetSize);
+                WintunSendPacket(g_WintunSession, osPacket);
+            }
         }
 
         std::lock_guard<std::mutex> lock(g_ClientsMutex);
         for (SOCKET otherSock : g_ServerClients) {
             if (otherSock != clientSock) {
+                // forward to other clients
                 std::vector<char> forwardBuffer(packetSize);
                 for (DWORD i = 0; i < packetSize; ++i) forwardBuffer[i] = recvBuffer[i] ^ ENCRYPTION_KEY;
-                send(otherSock, reinterpret_cast<char*>(&packetSize), sizeof(packetSize), 0);
-                send(otherSock, forwardBuffer.data(), static_cast<int>(packetSize), 0);
+                uint32_t fNetSize = htonl(static_cast<uint32_t>(packetSize));
+                SafeSendFully(otherSock, &fNetSize, sizeof(fNetSize));
+                SafeSendFully(otherSock, forwardBuffer.data(), static_cast<int>(packetSize));
             }
         }
     }

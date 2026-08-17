@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winsock2.h>
@@ -12,6 +12,9 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "ole32.lib")
+
+// Limits
+constexpr DWORD MAX_PACKET_SIZE = 65536; // 64 KiB
 
 // Идентификаторы элементов интерфейса
 #define IDC_IP_INPUT    101
@@ -46,7 +49,7 @@ extern SOCKET g_ListenSocket;
 extern std::vector<SOCKET> g_ServerClients;
 extern std::mutex g_ClientsMutex;
 extern int g_ClientSlot;
-extern const char ENCRYPTION_KEY;
+extern const unsigned char ENCRYPTION_KEY;
 
 extern HANDLE g_WintunAdapter;
 extern HANDLE g_WintunSession;
@@ -58,3 +61,4 @@ bool InitializeWintunDLL();
 void StopNetwork();
 void AsyncServerThread(int port);
 void AsyncClientThread(std::string ip, int port);
+
