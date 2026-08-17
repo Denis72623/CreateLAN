@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CreateLAN — Виртуальная локальная сеть</title>
+    <style>
+        :root {
+            --bg-color: #0d1117;
+            --text-color: #c9d1d9;
+            --accent-color: #238636;
+            --accent-hover: #2ea043;
+            --secondary-color: #21262d;
+            --secondary-hover: #30363d;
+            --card-bg: #161b22;
+            --border-color: #30363d;
+            --warning-color: #d29922;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 0;
+            line-height: 1.6;
+        }
+
+        header {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 40px 20px 20px 20px;
+            text-align: center;
+        }
+
+        h1 {
+            color: #ffffff;
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            font-size: 1.2rem;
+            color: #8b949e;
+            margin-bottom: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 0 20px 60px 20px;
+        }
+
+        .cta-group {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 40px;
+        }
+
+        @media (min-width: 480px) {
+            .cta-group {
+                flex-direction: row;
+                justify-content: center;
+            }
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 12px 32px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            text-decoration: none;
+            border-radius: 6px;
+            transition: background-color 0.2s, border-color 0.2s;
+            text-align: center;
+            box-sizing: border-box;
+        }
+
+        .btn-primary {
+            background-color: var(--accent-color);
+            color: #ffffff;
+            box-shadow: 0 4px 12px rgba(35, 134, 54, 0.2);
+        }
+
+        .btn-primary:hover {
+            background-color: var(--accent-hover);
+        }
+
+        .btn-secondary {
+            background-color: var(--secondary-color);
+            color: #c9d1d9;
+            border: 1px solid var(--border-color);
+        }
+
+        .btn-secondary:hover {
+            background-color: var(--secondary-hover);
+            border-color: #8b949e;
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 24px;
+            margin-bottom: 24px;
+        }
+
+        h2 {
+            color: #ffffff;
+            margin-top: 0;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 8px;
+        }
+
+        .warning-box {
+            border-left: 4px solid var(--warning-color);
+            background-color: rgba(210, 153, 34, 0.1);
+            padding: 16px;
+            border-radius: 0 6px 6px 0;
+            margin-bottom: 24px;
+        }
+
+        .warning-title {
+            color: var(--warning-color);
+            font-weight: bold;
+            margin-bottom: 8px;
+        }
+
+        ul {
+            padding-left: 20px;
+            margin: 0;
+        }
+
+        li {
+            margin-bottom: 8px;
+        }
+
+        footer {
+            text-align: center;
+            padding: 40px 20px;
+            font-size: 0.9rem;
+            color: #8b949e;
+            border-top: 1px solid var(--border-color);
+        }
+
+        footer a {
+            color: #58a6ff;
+            text-decoration: none;
+        }
+
+        footer a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>CreateLAN</h1>
+        <div class="subtitle">Инструмент для создания виртуальной локальной сети масштаба всего города</div>
+    </header>
+
+    <div class="container">
+        
+        <div class="cta-group">
+            <a href="https://denis72623.github.io/CreateLAN/CREATELANSETUP.exe" class="btn btn-primary">Скачать Create LAN</a>
+            <a href="https://denis72623.github.io/CreateLAN/CREATELANNOTSETUP.7z" class="btn btn-secondary">Скачать Create LAN без установщика</a>
+        </div>
+
+        <div class="warning-box">
+            <div class="warning-title">⚠️ Важные требования перед запуском:</div>
+            <ul>
+                <li>Необходим <strong>белый (публичный) IP-адрес</strong>.</li>
+                <li>Требуется <strong>разрешение провайдера</strong> на открытие портов.</li>
+                <li><strong>Безопасность:</strong> Не публикуйте и не разглашайте свой глобальный IP-адрес посторонним лицам.</li>
+            </ul>
+        </div>
+
+        <div class="card">
+            <h2>О проекте</h2>
+            <p><strong>CreateLAN</strong> — это специализированное программное решение, разработанное для объединения пользователей в единую виртуальную локальную сеть (LAN) в масштабах города. Проект позволяет играть в сетевые игры, обмениваться файлами и разворачивать локальные сервисы так, будто все участники находятся в одной комнате и подключены к одному роутеру.</p>
+        </div>
+
+        <div class="card">
+            <h2>Техническая информация</h2>
+            <p>Исходный код проекта открыт и доступен для анализа. Разработка ведется в директории <code>SourceCode/Project46</code> под свободной лицензией MIT.</p>
+        </div>
+
+    </div>
+
+    <footer>
+        <p>Разработчик: <a href="https://github.com/Denis72623" target="_blank">Denis72623</a> | Исходный код на <a href="https://github.com/Denis72623/CreateLAN" target="_blank">GitHub</a></p>
+    </footer>
+
+</body>
+</html>
