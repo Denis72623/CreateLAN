@@ -57,16 +57,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowW(L"Static", L" ЖУРНАЛ:", WS_VISIBLE | WS_CHILD, 20, 140, 350, 20, hwnd, NULL, NULL, NULL);
         HWND hLog = CreateWindowW(L"Edit", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 20, 165, 640, 180, hwnd, (HMENU)IDC_LOG_ZONE, NULL, NULL);
 
-        // UPnP checkbox (как раньше)
-        CreateWindowW(L"Button", L"Использовать UPnP", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
-            20, 360, 200, 20, hwnd, (HMENU)IDC_UPNP, NULL, NULL);
+        // UPnP checkbox
+        CreateWindowW(L"Button", L"Использовать UPnP", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 360, 200, 20, hwnd, (HMENU)IDC_UPNP, NULL, NULL);
 
-        // Установить шрифт для новых контролов (предполагается, что hFont уже создан выше)
+        SendMessageW(GetDlgItem(hwnd, IDC_IP_INPUT), WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(GetDlgItem(hwnd, IDC_PORT_INPUT), WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(GetDlgItem(hwnd, IDC_BTN_SERVER), WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(GetDlgItem(hwnd, IDC_BTN_CLIENT), WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(GetDlgItem(hwnd, IDC_BTN_STOP), WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hLog, WM_SETFONT, (WPARAM)hFont, TRUE);
         SendMessageW(GetDlgItem(hwnd, IDC_UPNP), WM_SETFONT, (WPARAM)hFont, TRUE);
-        // метка статическая наследует системный шрифт; если нужно, можно тоже явно задать:
-        SendMessageW(GetDlgItem(hwnd, IDC_LOG_ZONE), WM_SETFONT, (WPARAM)hFont, TRUE);
 
-        hLogZone = hLog; // extern used by network logging
+        hLogZone = hLog;
 
         if (!InitializeWintunDLL()) {
             LogMessage(L"[ERR] Библиотека wintun.dll x64 не найдена!");
@@ -82,18 +84,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             wchar_t portBuf[32]; GetWindowTextW(GetDlgItem(hwnd, IDC_PORT_INPUT), portBuf, _countof(portBuf));
             int port = _wtoi(portBuf);
 
-            // read custom mask value into global
+            // Read mask from field into global (thread-safe)
             LRESULT maskLen = GetWindowTextLengthW(GetDlgItem(hwnd, IDC_MASK_INPUT));
             std::wstring wmask(maskLen + 1, L'\0');
-            GetWindowTextW(GetDlgItem(hwnd, IDC_MASK_INPUT), &wmask[0], (int)wmask.size());
-            wmask.resize(maskLen);
+            if (maskLen > 0) {
+                GetWindowTextW(GetDlgItem(hwnd, IDC_MASK_INPUT), &wmask[0], (int)wmask.size());
+                wmask.resize(maskLen);
+            }
+            else wmask.clear();
             {
                 std::lock_guard<std::mutex> lg(g_CustomMaskMutex);
-                g_CustomSubnetMask = WStringToString(wmask);
+                g_CustomSubnetMask = std::string(wmask.begin(), wmask.end());
             }
-            // read checkbox state
-            LRESULT stateMask = SendMessageW(GetDlgItem(hwnd, IDC_USE_CUSTOM_MASK), BM_GETCHECK, 0, 0);
-            g_UseCustomSubnetMask.store(stateMask == BST_CHECKED);
+
+            LRESULT state = SendMessageW(GetDlgItem(hwnd, IDC_UPNP), BM_GETCHECK, 0, 0);
+            g_UseUPnP.store(state == BST_CHECKED);
 
             EnableWindow(GetDlgItem(hwnd, IDC_BTN_SERVER), FALSE);
             EnableWindow(GetDlgItem(hwnd, IDC_BTN_CLIENT), FALSE);
@@ -107,17 +112,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::wstring ws(ipBuf);
             std::string ipStr(ws.begin(), ws.end());
 
-            // read custom mask value into global
+            // Read mask into global
             LRESULT maskLen = GetWindowTextLengthW(GetDlgItem(hwnd, IDC_MASK_INPUT));
             std::wstring wmask(maskLen + 1, L'\0');
-            GetWindowTextW(GetDlgItem(hwnd, IDC_MASK_INPUT), &wmask[0], (int)wmask.size());
-            wmask.resize(maskLen);
+            if (maskLen > 0) {
+                GetWindowTextW(GetDlgItem(hwnd, IDC_MASK_INPUT), &wmask[0], (int)wmask.size());
+                wmask.resize(maskLen);
+            }
+            else wmask.clear();
             {
                 std::lock_guard<std::mutex> lg(g_CustomMaskMutex);
-                g_CustomSubnetMask = WStringToString(wmask);
+                g_CustomSubnetMask = std::string(wmask.begin(), wmask.end());
             }
-            LRESULT stateMask = SendMessageW(GetDlgItem(hwnd, IDC_USE_CUSTOM_MASK), BM_GETCHECK, 0, 0);
-            g_UseCustomSubnetMask.store(stateMask == BST_CHECKED);
+
+            LRESULT state = SendMessageW(GetDlgItem(hwnd, IDC_UPNP), BM_GETCHECK, 0, 0);
+            g_UseUPnP.store(state == BST_CHECKED);
 
             EnableWindow(GetDlgItem(hwnd, IDC_BTN_SERVER), FALSE);
             EnableWindow(GetDlgItem(hwnd, IDC_BTN_CLIENT), FALSE);
@@ -127,18 +136,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             StopNetwork();
             EnableWindow(GetDlgItem(hwnd, IDC_BTN_SERVER), TRUE);
             EnableWindow(GetDlgItem(hwnd, IDC_BTN_CLIENT), TRUE);
-        }
-        else if (id == IDC_UPNP) {
-            LRESULT state = SendMessageW(GetDlgItem(hwnd, IDC_UPNP), BM_GETCHECK, 0, 0);
-            g_UseUPnP.store(state == BST_CHECKED);
-            if (g_UseUPnP.load()) LogMessage(L"[SET] UPnP включён");
-            else LogMessage(L"[SET] UPnP выключен");
-        }
-        else if (id == IDC_USE_CUSTOM_MASK) {
-            LRESULT state = SendMessageW(GetDlgItem(hwnd, IDC_USE_CUSTOM_MASK), BM_GETCHECK, 0, 0);
-            g_UseCustomSubnetMask.store(state == BST_CHECKED);
-            if (g_UseCustomSubnetMask.load()) LogMessage(L"[SET] Используется свой маска подсети");
-            else LogMessage(L"[SET] Используется маска по умолчанию");
         }
         break;
     }

@@ -1,5 +1,4 @@
-﻿// network.cpp — полный файл с исправленной валидацией маски подсети
-#include "network.h"
+﻿#include "network.h"
 #include "upnp_simple.h"
 #include <vector>
 #include <algorithm>
@@ -10,7 +9,7 @@
 #include <sstream>
 #include <objbase.h>
 #include <cctype>
-#include <bitset> // добавлено для подсчёта единиц в маске
+#include <bitset>
 
 WINTUN_CREATE_ADAPTER_FUNC WintunCreateAdapter = nullptr;
 WINTUN_START_SESSION_FUNC WintunStartSession = nullptr;
@@ -21,7 +20,7 @@ WINTUN_RELEASE_RECEIVE_PACKET_FUNC WintunReleaseReceivePacket = nullptr;
 WINTUN_CLOSE_ADAPTER_FUNC WintunCloseAdapter = nullptr;
 
 // Globals
-std::atomic<uint32_t> g_MaxClients(0); // 0 = no configured client limit
+std::atomic<uint32_t> g_MaxClients(0);
 std::atomic<bool> g_TunnelActive(false);
 std::mutex g_ClientsMutex;
 std::vector<SOCKET> g_ServerClients;
@@ -34,22 +33,20 @@ HWND hLogZone = nullptr;
 std::atomic<bool> g_UseUPnP(false);
 std::atomic<uint16_t> g_CurrentServerPort(0);
 
-// Custom subnet globals
-std::atomic<bool> g_UseCustomSubnetMask(false);
+// Mask input globals
 std::string g_CustomSubnetMask;
 std::mutex g_CustomMaskMutex;
 
-// Address pool structures
+// Address pool
 static std::mutex g_ipMutex;
-static uint32_t g_nextIpId = 2; // reserve id=1 for server (10.8.0.1)
-static std::stack<uint32_t> g_freeIpIds; // reuse on disconnect
-static std::unordered_map<uint32_t, SOCKET> g_IpToSocketMap; // host-order ip -> socket
+static uint32_t g_nextIpId = 2;
+static std::stack<uint32_t> g_freeIpIds;
+static std::unordered_map<uint32_t, SOCKET> g_IpToSocketMap;
 
-// Simple XOR key (placeholder)
 static const uint8_t ENCRYPTION_KEY = 'X';
 
 namespace Encryption {
-    void Init() { /* no-op */ }
+    void Init() {}
     void Encrypt(uint8_t* buf, uint32_t size) {
         for (uint32_t i = 0; i < size; ++i) buf[i] ^= ENCRYPTION_KEY;
     }
@@ -58,14 +55,13 @@ namespace Encryption {
     }
 }
 
-// Helper utilities (Safe recv/send, IP helpers)
-
+// Safe recv/send
 bool SafeRecvFully(SOCKET sock, void* buf, int len) {
     char* p = static_cast<char*>(buf);
     int total = 0;
     while (total < len) {
         int r = recv(sock, p + total, len - total, 0);
-        if (r == 0) return false; // closed
+        if (r == 0) return false;
         if (r == SOCKET_ERROR) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK || err == WSAEINTR) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
@@ -117,9 +113,7 @@ uint32_t AllocateClientIP() {
         uint32_t id = g_freeIpIds.top(); g_freeIpIds.pop();
         return makeIpFromId(id);
     }
-    if (g_nextIpId == 0 || g_nextIpId >= ADDRESS_POOL_SIZE) {
-        return 0;
-    }
+    if (g_nextIpId == 0 || g_nextIpId >= ADDRESS_POOL_SIZE) return 0;
     uint32_t id = g_nextIpId++;
     return makeIpFromId(id);
 }
@@ -129,15 +123,11 @@ void ReleaseClientIP(uint32_t ipHostOrder) {
     uint8_t c = static_cast<uint8_t>((ipHostOrder >> 8) & 0xFF);
     uint8_t d = static_cast<uint8_t>(ipHostOrder & 0xFF);
     uint32_t id = (static_cast<uint32_t>(c) << 8) | static_cast<uint32_t>(d);
-    if (id >= 2 && id < ADDRESS_POOL_SIZE) {
-        g_freeIpIds.push(id);
-    }
+    if (id >= 2 && id < ADDRESS_POOL_SIZE) g_freeIpIds.push(id);
 }
 
-// Logging helper
 void LogMessage(const std::wstring& msg) {
     if (!hLogZone) {
-        // fallback to OutputDebugString
         OutputDebugStringW((msg + L"\r\n").c_str());
         return;
     }
@@ -147,7 +137,6 @@ void LogMessage(const std::wstring& msg) {
     SendMessageW(hLogZone, EM_REPLACESEL, 0, (LPARAM)dynamicMsg.c_str());
 }
 
-// Wintun loader
 bool InitializeWintunDLL() {
     HMODULE wintunLib = LoadLibraryW(L"wintun.dll");
     if (!wintunLib) return false;
@@ -161,18 +150,52 @@ bool InitializeWintunDLL() {
     return (WintunCreateAdapter && WintunStartSession && WintunAllocateSendPacket && WintunSendPacket && WintunReceivePacket && WintunReleaseReceivePacket && WintunCloseAdapter);
 }
 
-// Encryption send helper
-static void EncryptAndSend(SOCKET sock, const uint8_t* data, uint32_t size) {
+// Remove client safely (idempotent)
+static void RemoveClientSocket(SOCKET sock) {
     if (sock == INVALID_SOCKET) return;
-    if (size == 0 || size > MAX_PACKET_SIZE) return;
+
+    // remove from g_ServerClients
+    {
+        std::lock_guard<std::mutex> lock(g_ClientsMutex);
+        auto it = std::find(g_ServerClients.begin(), g_ServerClients.end(), sock);
+        if (it != g_ServerClients.end()) g_ServerClients.erase(it);
+    }
+
+    // remove from g_IpToSocketMap and release IP
+    uint32_t ipToRelease = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_ipMutex);
+        for (auto it = g_IpToSocketMap.begin(); it != g_IpToSocketMap.end(); ++it) {
+            if (it->second == sock) {
+                ipToRelease = it->first;
+                g_IpToSocketMap.erase(it);
+                break;
+            }
+        }
+    }
+    if (ipToRelease != 0) {
+        ReleaseClientIP(ipToRelease);
+    }
+
+    // shutdown & close socket
+    shutdown(sock, SD_BOTH);
+    closesocket(sock);
+
+    LogMessage(L"[CONNECT] Клиент удалён (socket closed).");
+}
+
+// Encrypt and send; returns false on failure.
+static bool EncryptAndSend(SOCKET sock, const uint8_t* data, uint32_t size) {
+    if (sock == INVALID_SOCKET) return false;
+    if (size == 0 || size > MAX_PACKET_SIZE) return false;
     std::vector<uint8_t> tmp(data, data + size);
     Encryption::Encrypt(tmp.data(), size);
     uint32_t netSize = htonl(size);
-    if (!SafeSendFully(sock, &netSize, sizeof(netSize))) return;
-    SafeSendFully(sock, tmp.data(), static_cast<int>(size));
+    if (!SafeSendFully(sock, &netSize, sizeof(netSize))) return false;
+    if (!SafeSendFully(sock, tmp.data(), static_cast<int>(size))) return false;
+    return true;
 }
 
-// Server runners (Wintun->network)
 void ServerOsToNetworkWorker() {
     while (g_TunnelActive) {
         if (!g_WintunSession || !WintunReceivePacket) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
@@ -193,23 +216,43 @@ void ServerOsToNetworkWorker() {
                 if (it != g_IpToSocketMap.end()) target = it->second;
             }
             if (target != INVALID_SOCKET) {
-                EncryptAndSend(target, packetData, packetSize);
+                if (!EncryptAndSend(target, packetData, packetSize)) {
+                    RemoveClientSocket(target);
+                }
             }
             else {
-                std::lock_guard<std::mutex> lock(g_ClientsMutex);
-                for (SOCKET s : g_ServerClients) EncryptAndSend(s, packetData, packetSize);
+                // broadcast: copy list under lock then send without lock
+                std::vector<SOCKET> clients;
+                {
+                    std::lock_guard<std::mutex> lock(g_ClientsMutex);
+                    clients = g_ServerClients;
+                }
+                for (SOCKET s : clients) {
+                    if (s == INVALID_SOCKET) continue;
+                    if (!EncryptAndSend(s, packetData, packetSize)) {
+                        RemoveClientSocket(s);
+                    }
+                }
             }
         }
         else {
-            std::lock_guard<std::mutex> lock(g_ClientsMutex);
-            for (SOCKET s : g_ServerClients) EncryptAndSend(s, packetData, packetSize);
+            std::vector<SOCKET> clients;
+            {
+                std::lock_guard<std::mutex> lock(g_ClientsMutex);
+                clients = g_ServerClients;
+            }
+            for (SOCKET s : clients) {
+                if (s == INVALID_SOCKET) continue;
+                if (!EncryptAndSend(s, packetData, packetSize)) {
+                    RemoveClientSocket(s);
+                }
+            }
         }
 
         WintunReleaseReceivePacket(g_WintunSession, packetData);
     }
 }
 
-// Client OS -> network
 void ClientOsToNetworkWorker() {
     while (g_TunnelActive) {
         if (!g_WintunSession || !WintunReceivePacket) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
@@ -219,13 +262,17 @@ void ClientOsToNetworkWorker() {
         if (packetSize > MAX_PACKET_SIZE) { WintunReleaseReceivePacket(g_WintunSession, packetData); continue; }
 
         if (g_ClientActiveSocket != INVALID_SOCKET) {
-            EncryptAndSend(g_ClientActiveSocket, packetData, packetSize);
+            if (!EncryptAndSend(g_ClientActiveSocket, packetData, packetSize)) {
+                // client-side: failed to send to server -> stop network
+                RemoveClientSocket(g_ClientActiveSocket);
+                g_ClientActiveSocket = INVALID_SOCKET;
+                g_TunnelActive = false;
+            }
         }
         WintunReleaseReceivePacket(g_WintunSession, packetData);
     }
 }
 
-// Per-client worker
 void ServerSingleClientWorker(SOCKET clientSock) {
     SOCKET sock = clientSock;
     uint32_t assignedIp = 0;
@@ -268,52 +315,48 @@ void ServerSingleClientWorker(SOCKET clientSock) {
                 if (it != g_IpToSocketMap.end()) target = it->second;
             }
             if (target != INVALID_SOCKET && target != sock) {
-                EncryptAndSend(target, buffer.data(), packetSize);
+                if (!EncryptAndSend(target, buffer.data(), packetSize)) {
+                    RemoveClientSocket(target);
+                }
             }
             else {
-                std::lock_guard<std::mutex> lock(g_ClientsMutex);
-                for (SOCKET other : g_ServerClients) {
+                std::vector<SOCKET> clients;
+                {
+                    std::lock_guard<std::mutex> lock(g_ClientsMutex);
+                    clients = g_ServerClients;
+                }
+                for (SOCKET other : clients) {
                     if (other == sock) continue;
-                    EncryptAndSend(other, buffer.data(), packetSize);
+                    if (!EncryptAndSend(other, buffer.data(), packetSize)) {
+                        RemoveClientSocket(other);
+                    }
                 }
             }
         }
         else {
-            std::lock_guard<std::mutex> lock(g_ClientsMutex);
-            for (SOCKET other : g_ServerClients) {
+            std::vector<SOCKET> clients;
+            {
+                std::lock_guard<std::mutex> lock(g_ClientsMutex);
+                clients = g_ServerClients;
+            }
+            for (SOCKET other : clients) {
                 if (other == sock) continue;
-                EncryptAndSend(other, buffer.data(), packetSize);
+                if (!EncryptAndSend(other, buffer.data(), packetSize)) {
+                    RemoveClientSocket(other);
+                }
             }
         }
     }
 
-    // cleanup mapping & socket
-    {
-        std::lock_guard<std::mutex> lock(g_ClientsMutex);
-        auto it = std::find(g_ServerClients.begin(), g_ServerClients.end(), sock);
-        if (it != g_ServerClients.end()) g_ServerClients.erase(it);
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_ipMutex);
-        uint32_t ipToRelease = 0;
-        for (auto it = g_IpToSocketMap.begin(); it != g_IpToSocketMap.end(); ++it) {
-            if (it->second == sock) {
-                ipToRelease = it->first; g_IpToSocketMap.erase(it); break;
-            }
-        }
-        if (ipToRelease != 0) ReleaseClientIP(ipToRelease);
-    }
-
-    shutdown(sock, SD_BOTH); closesocket(sock);
+    // centralized cleanup
+    RemoveClientSocket(sock);
     LogMessage(L"[CONNECT] Клиент отключился.");
 }
 
-// Stop network and cleanup
 void StopNetwork() {
     g_TunnelActive = false;
     LogMessage(L"[STATUS] Остановка сети...");
 
-    // remove UPnP mapping if any
     uint16_t port = g_CurrentServerPort.load();
     if (port != 0 && g_UseUPnP.load()) {
         std::string control, svc, base;
@@ -349,7 +392,6 @@ void StopNetwork() {
     LogMessage(L"[STATUS] Сеть остановлена.");
 }
 
-// Execute netsh via CreateProcessW
 bool ExecuteNetshCommand(const std::wstring& cmd) {
     std::wstring full = L"netsh " + cmd;
     std::vector<wchar_t> buf(full.begin(), full.end());
@@ -364,23 +406,17 @@ bool ExecuteNetshCommand(const std::wstring& cmd) {
     return true;
 }
 
-// ---------- New, robust helpers for mask parsing & GetEffectiveSubnetMask ----------
-
-// trim helpers
+// trim helpers and mask parsing (default /16)
 static inline std::string trim_str(const std::string& s) {
-    size_t a = 0;
-    while (a < s.size() && isspace((unsigned char)s[a])) ++a;
-    size_t b = s.size();
-    while (b > a && isspace((unsigned char)s[b - 1])) --b;
+    size_t a = 0; while (a < s.size() && isspace((unsigned char)s[a])) ++a;
+    size_t b = s.size(); while (b > a && isspace((unsigned char)s[b - 1])) --b;
     return s.substr(a, b - a);
 }
-
 static bool IsDigitsStrict(const std::string& s) {
     if (s.empty()) return false;
     for (char c : s) if (!std::isdigit((unsigned char)c)) return false;
     return true;
 }
-
 static bool PrefixToMaskUint(int prefix, uint32_t& outMask) {
     if (prefix < 0 || prefix > 32) return false;
     if (prefix == 0) { outMask = 0u; return true; }
@@ -388,12 +424,10 @@ static bool PrefixToMaskUint(int prefix, uint32_t& outMask) {
     outMask = (~0u) << (32 - prefix);
     return true;
 }
-
 static bool DottedToMaskUint(const std::string& dotted, uint32_t& outMask) {
     std::stringstream ss(dotted);
     std::string tok;
-    uint32_t parts[4];
-    int idx = 0;
+    uint32_t parts[4]; int idx = 0;
     while (std::getline(ss, tok, '.')) {
         if (idx >= 4) return false;
         if (!IsDigitsStrict(tok)) return false;
@@ -405,99 +439,43 @@ static bool DottedToMaskUint(const std::string& dotted, uint32_t& outMask) {
     outMask = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
     return true;
 }
-
-static int CountOnesUint(uint32_t x) {
-    return static_cast<int>(std::bitset<32>(x).count());
-}
-
+static int CountOnesUint(uint32_t x) { return static_cast<int>(std::bitset<32>(x).count()); }
 static std::string MaskUintToDotted(uint32_t mask) {
     char buf[32];
-    uint8_t a = (mask >> 24) & 0xFF;
-    uint8_t b = (mask >> 16) & 0xFF;
-    uint8_t c = (mask >> 8) & 0xFF;
-    uint8_t d = mask & 0xFF;
-    sprintf_s(buf, "%u.%u.%u.%u", a, b, c, d);
+    sprintf_s(buf, "%u.%u.%u.%u", (mask >> 24) & 0xFF, (mask >> 16) & 0xFF, (mask >> 8) & 0xFF, mask & 0xFF);
     return std::string(buf);
 }
 
 static std::string GetEffectiveSubnetMask() {
-    const std::string defaultMask = "255.255.0.0"; // default kept for gamers/others
+    const std::string defaultMask = "255.255.0.0"; // default /16 for many clients
 
     std::string s;
     {
         std::lock_guard<std::mutex> lg(g_CustomMaskMutex);
         s = g_CustomSubnetMask;
     }
-    // trim
-    auto trim_str = [](std::string t) {
-        size_t a = 0; while (a < t.size() && isspace((unsigned char)t[a])) ++a;
-        size_t b = t.size(); while (b > a && isspace((unsigned char)t[b - 1])) --b;
-        return t.substr(a, b - a);
-        };
     s = trim_str(s);
     if (s.empty()) return defaultMask;
 
-    // accept "/24" or "24" or dotted "255.255.255.0"
     if (s[0] == '/') s = s.substr(1);
-
-    auto is_digits = [](const std::string& x) {
-        if (x.empty()) return false;
-        for (char c : x) if (!std::isdigit((unsigned char)c)) return false;
-        return true;
-        };
-
-    auto prefix_to_mask = [](int prefix, uint32_t& outMask)->bool {
-        if (prefix < 0 || prefix > 32) return false;
-        if (prefix == 0) { outMask = 0u; return true; }
-        if (prefix == 32) { outMask = 0xFFFFFFFFu; return true; }
-        outMask = (~0u) << (32 - prefix);
-        return true;
-        };
-
-    auto dotted_to_uint = [&](const std::string& dotted, uint32_t& outMask)->bool {
-        std::stringstream ss(dotted);
-        std::string tok; uint32_t parts[4]; int idx = 0;
-        while (std::getline(ss, tok, '.')) {
-            if (idx >= 4) return false;
-            if (!is_digits(tok)) return false;
-            int v = std::stoi(tok);
-            if (v < 0 || v > 255) return false;
-            parts[idx++] = static_cast<uint32_t>(v);
-        }
-        if (idx != 4) return false;
-        outMask = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
-        return true;
-        };
-
-    auto mask_to_dotted = [](uint32_t m)->std::string {
-        char buf[32];
-        sprintf_s(buf, "%u.%u.%u.%u", (m >> 24) & 0xFF, (m >> 16) & 0xFF, (m >> 8) & 0xFF, m & 0xFF);
-        return std::string(buf);
-        };
-
-    if (is_digits(s)) {
+    if (IsDigitsStrict(s)) {
         int prefix = std::stoi(s);
-        uint32_t mu;
-        if (!prefix_to_mask(prefix, mu)) return defaultMask;
-        return mask_to_dotted(mu);
+        uint32_t maskUint;
+        if (!PrefixToMaskUint(prefix, maskUint)) return defaultMask;
+        return MaskUintToDotted(maskUint);
     }
-
     if (s.find('.') != std::string::npos) {
-        uint32_t mu;
-        if (!dotted_to_uint(s, mu)) return defaultMask;
-        // проверим непрерывность единиц
-        int ones = static_cast<int>(std::bitset<32>(mu).count());
+        uint32_t maskUint;
+        if (!DottedToMaskUint(s, maskUint)) return defaultMask;
+        int ones = CountOnesUint(maskUint);
         uint32_t recon;
-        if (!prefix_to_mask(ones, recon)) return defaultMask;
-        if (recon != mu) return defaultMask;
-        return mask_to_dotted(mu);
+        if (!PrefixToMaskUint(ones, recon)) return defaultMask;
+        if (recon != maskUint) return defaultMask;
+        return MaskUintToDotted(maskUint);
     }
-
     return defaultMask;
 }
-// ---------- end of mask helpers --------------------------------------------------
 
-// Setup Wintun adapter + netsh IP assignment
 bool SetupVirtualAdapter(int mode) {
     if (!WintunCreateAdapter || !WintunStartSession) return false;
     GUID adapterGuid; CoCreateGuid(&adapterGuid);
@@ -517,13 +495,12 @@ bool SetupVirtualAdapter(int mode) {
         ExecuteNetshCommand(cmdEnable);
         std::wstring cmdIp = L"interface ip set address name=\"P2P_Virtual_LAN\" static " + wSrvIp + L" " + wMask;
         ExecuteNetshCommand(cmdIp);
-        LogMessage(L"[NET] Серверный IP назначен: " + std::wstring(srvIpStr.begin(), srvIpStr.end()) + L" Маска: " + std::wstring(mask.begin(), mask.end()));
+        LogMessage(L"[NET] Серверный IP назначен: " + std::wstring(wSrvIp) + L" Маска: " + std::wstring(wMask));
     }
     std::this_thread::sleep_for(std::chrono::seconds(1));
     return true;
 }
 
-// Start server
 void StartServer(int port) {
     if (!InitializeWintunDLL()) { LogMessage(L"[ERR] wintun.dll не загружен."); return; }
     if (!SetupVirtualAdapter(1)) return;
@@ -541,12 +518,12 @@ void StartServer(int port) {
     g_TunnelActive = true;
     g_CurrentServerPort.store(static_cast<uint16_t>(port));
 
-    // UPnP: attempt mapping if requested
     if (g_UseUPnP.load()) {
         std::string control, svc, base;
         if (UPnP_Discover(control, svc, base, 3000)) {
             std::string ext = UPnP_GetExternalIPAddress(control, svc, base);
-            if (!ext.empty()) LogMessage(L"[UPnP] External IP: " + std::wstring(ext.begin(), ext.end()));
+            std::wstring wext(ext.begin(), ext.end());
+            if (!ext.empty()) LogMessage(L"[UPnP] External IP: " + wext);
             bool mapped = UPnP_AddPortMapping(control, svc, "0.0.0.0", static_cast<uint16_t>(port), static_cast<uint16_t>(port), "TCP", "CreateLAN auto mapping", 0);
             if (mapped) LogMessage(L"[UPnP] Проброс порта успешно создан.");
             else LogMessage(L"[UPnP] Не удалось создать проброс порта через UPnP.");
@@ -588,7 +565,9 @@ void StartServer(int port) {
                 std::lock_guard<std::mutex> ipLock(g_ipMutex);
                 g_IpToSocketMap[assignedIp] = client;
             }
-            LogMessage(std::wstring(L"[CONNECT] Новый участник. IP: ") + std::wstring(IPv4ToString(assignedIp).begin(), IPv4ToString(assignedIp).end()));
+            std::string ipStr = IPv4ToString(assignedIp);
+            std::wstring wip(ipStr.begin(), ipStr.end());
+            LogMessage(L"[CONNECT] Новый участник. IP: " + wip);
             g_ClientThreads.emplace_back(&ServerSingleClientWorker, client);
         }
     }
@@ -596,7 +575,6 @@ void StartServer(int port) {
     StopNetwork();
 }
 
-// Start client: connect, receive assigned IP, apply to adapter, then run worker loops
 void StartClient(const std::string& serverIp, int serverPort) {
     if (!InitializeWintunDLL()) { LogMessage(L"[ERR] wintun.dll не загружен."); return; }
     if (!SetupVirtualAdapter(2)) return;
@@ -621,13 +599,14 @@ void StartClient(const std::string& serverIp, int serverPort) {
     }
     uint32_t assignedHostIp = ntohl(netIp);
     std::string assignedIpStr = IPv4ToString(assignedHostIp);
-    LogMessage(std::wstring(L"[NET] Получен назначенный IP: ") + std::wstring(assignedIpStr.begin(), assignedIpStr.end()));
+    std::wstring wAssignedIp(assignedIpStr.begin(), assignedIpStr.end());
+    LogMessage(L"[NET] Получен назначенный IP: " + wAssignedIp);
 
-    // Apply IP + mask. Use custom mask if enabled.
     std::string mask = GetEffectiveSubnetMask();
+    std::wstring wMask(mask.begin(), mask.end());
     std::wstring cmdEnable = L"interface set interface name=\"P2P_Virtual_LAN\" admin=enabled";
     ExecuteNetshCommand(cmdEnable);
-    std::wstring cmdIp = L"interface ip set address name=\"P2P_Virtual_LAN\" static " + std::wstring(assignedIpStr.begin(), assignedIpStr.end()) + L" " + std::wstring(mask.begin(), mask.end());
+    std::wstring cmdIp = L"interface ip set address name=\"P2P_Virtual_LAN\" static " + std::wstring(wAssignedIp) + L" " + wMask;
     ExecuteNetshCommand(cmdIp);
 
     g_ClientActiveSocket = sock;
@@ -636,7 +615,7 @@ void StartClient(const std::string& serverIp, int serverPort) {
     std::thread osWorker(ClientOsToNetworkWorker);
     osWorker.detach();
 
-    LogMessage(L"[MATRIX] Подключение установлено. IP assigned: " + std::wstring(assignedIpStr.begin(), assignedIpStr.end()));
+    LogMessage(L"[MATRIX] Подключение установлено. IP assigned: " + wAssignedIp);
 
     while (g_TunnelActive) {
         uint32_t netSize = 0;

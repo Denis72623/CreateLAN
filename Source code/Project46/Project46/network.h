@@ -23,10 +23,7 @@ constexpr int IDC_BTN_CLIENT = 104;
 constexpr int IDC_BTN_STOP = 105;
 constexpr int IDC_LOG_ZONE = 106;
 constexpr int IDC_UPNP = 107;
-
-// New controls for custom subnet mask
-constexpr int IDC_USE_CUSTOM_MASK = 108; // checkbox
-constexpr int IDC_MASK_INPUT = 109;      // edit box for mask text
+constexpr int IDC_MASK_INPUT = 108; // edit box for mask text
 
 // Addressing defaults
 constexpr uint32_t ADDRESS_POOL_SIZE = 0xFFFF; // use 1..65534
@@ -38,9 +35,8 @@ extern std::atomic<uint32_t> g_MaxClients;
 extern std::atomic<bool> g_UseUPnP;
 extern std::atomic<uint16_t> g_CurrentServerPort;
 
-// New globals for custom subnet mask UI/state
-extern std::atomic<bool> g_UseCustomSubnetMask; // whether to use custom mask
-extern std::string g_CustomSubnetMask; // protected by g_CustomMaskMutex when needed
+// Globals for mask input (optional)
+extern std::string g_CustomSubnetMask;
 extern std::mutex g_CustomMaskMutex;
 
 // Wintun prototypes (dynamic)
